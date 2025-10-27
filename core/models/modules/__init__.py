@@ -3,3 +3,4 @@
 
 from .dino_base import DINOBase
 from .style_unet import StyleUNet
+from .detail_enhancer import DetailEnhancer, FrequencyEnhancer

@@ -167,6 +167,14 @@ class DriverData(torch.utils.data.Dataset):
             'f_image': deepcopy(self.f_image), 'f_planes': deepcopy(self.f_planes), 
             't_image': t_image, 't_points': t_points, 't_transform': this_record['transform_matrix'], 
             'infos': {'t_key':frame_key},
+            # Store original FLAME parameters for enhancement modules
+            'flame_params': {
+                'shapecode': self.f_shape,
+                'expcode': this_record['expcode'],
+                'posecode': this_record['posecode'],
+                'eyecode': this_record['eyecode'],
+                'transform_matrix': this_record['transform_matrix']
+            }
         }
         return one_data
 

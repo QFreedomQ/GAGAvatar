@@ -13,11 +13,19 @@ from core.data import DriverData
 from core.models import build_model
 from core.libs.utils import ConfigDict
 from core.libs.GAGAvatar_track.engines import CoreEngine as TrackEngine
+from core.libs.temporal_smoother import TemporalSmoother
+from core.libs.expression_optimizer import ExpressionOptimizer
+from core.libs.gaze_corrector import GazeCorrector
 
-def inference(image_path, driver_path, resume_path, force_retrack=False, device='cuda'):
+def inference(image_path, driver_path, resume_path, force_retrack=False, device='cuda', 
+              temporal_smooth=False, detail_enhance=False, expression_opt=False, gaze_correct=False, enhanced=False):
     lightning.fabric.seed_everything(42)
     driver_path = driver_path[:-1] if driver_path.endswith('/') else driver_path
     driver_name = os.path.basename(driver_path).split('.')[0]
+    
+    # Enable all enhancements if 'enhanced' flag is set
+    if enhanced:
+        temporal_smooth = detail_enhance = expression_opt = gaze_correct = True
     # load model
     print(f'Loading model...')
     lightning_fabric = lightning.Fabric(accelerator=device, strategy='auto', devices=[0],)
@@ -30,6 +38,25 @@ def inference(image_path, driver_path, resume_path, force_retrack=False, device=
     model.eval()
     print(str(meta_cfg))
     track_engine = TrackEngine(focal_length=12.0, device=device)
+    
+    # Initialize enhancement modules
+    # Innovation 1: Temporal Smoother
+    temporal_smoother = TemporalSmoother(alpha=0.5, window_size=5, use_kalman=True) if temporal_smooth else None
+    # Innovation 3: Expression Optimizer
+    expression_optimizer = ExpressionOptimizer(n_exp=100, global_weight=0.7, local_weight=0.3) if expression_opt else None
+    # Innovation 4: Gaze Corrector
+    gaze_corrector = GazeCorrector(correction_strength=0.7, enhance_eyes=True) if gaze_correct else None
+    
+    # Print enabled enhancements
+    enhancements = []
+    if temporal_smooth: enhancements.append("Temporal Smoothing")
+    if detail_enhance: enhancements.append("Detail Enhancement")
+    if expression_opt: enhancements.append("Expression Optimization")
+    if gaze_correct: enhancements.append("Gaze Correction")
+    if enhancements:
+        print(f"Enabled enhancements: {', '.join(enhancements)}")
+    else:
+        print("No enhancements enabled (standard mode)")
     # build input data
     feature_name = os.path.basename(image_path).split('.')[0]
     feature_data = get_tracked_results(image_path, track_engine, force_retrack=force_retrack)
@@ -67,10 +94,55 @@ def inference(image_path, driver_path, resume_path, force_retrack=False, device=
     # batch['t_transform'] = build_camera(view_angles[idx])
 
     for idx, batch in enumerate(tqdm(driver_dataloader)):
-        render_results = model.forward_expression(batch)
+        # Apply enhancements to batch data before rendering
+        if 'flame_params' in batch:
+            flame_params = batch['flame_params']
+            
+            # Innovation 1: Temporal Smoothing
+            if temporal_smoother is not None:
+                smoothed_params = temporal_smoother.smooth(flame_params)
+                # Update batch with smoothed parameters - need to recompute points
+                if 'expcode' in smoothed_params:
+                    batch['t_points'] = driver_dataset.flame_model(
+                        shape_params=smoothed_params['shapecode'][None],
+                        pose_params=smoothed_params['posecode'][None],
+                        expression_params=smoothed_params['expcode'][None],
+                        eye_pose_params=smoothed_params['eyecode'][None],
+                    )[0].float()
+                if 'transform_matrix' in smoothed_params:
+                    batch['t_transform'] = temporal_smoother.smooth_transform(smoothed_params['transform_matrix'])
+            
+            # Innovation 3: Expression Optimization
+            if expression_optimizer is not None and 'expcode' in flame_params:
+                optimized_exp = expression_optimizer.optimize_expression(flame_params['expcode'])
+                batch['t_points'] = driver_dataset.flame_model(
+                    shape_params=flame_params['shapecode'][None],
+                    pose_params=flame_params['posecode'][None],
+                    expression_params=optimized_exp[None],
+                    eye_pose_params=flame_params['eyecode'][None],
+                )[0].float()
+            
+            # Innovation 4: Gaze Correction
+            if gaze_corrector is not None and 'eyecode' in flame_params:
+                corrected_eyecode = gaze_corrector.correct_gaze(flame_params['eyecode'])
+                batch['t_points'] = driver_dataset.flame_model(
+                    shape_params=flame_params['shapecode'][None],
+                    pose_params=flame_params['posecode'][None],
+                    expression_params=flame_params['expcode'][None],
+                    eye_pose_params=corrected_eyecode[None],
+                )[0].float()
+        
+        # Innovation 2: Detail Enhancement (applied in model forward)
+        render_results = model.forward_expression(batch, enable_detail_enhance=detail_enhance, detail_strength=1.0)
+        
         gt_rgb = render_results['t_image'].clamp(0, 1)
         # pred_rgb = render_results['gen_image'].clamp(0, 1)
         pred_sr_rgb = render_results['sr_gen_image'].clamp(0, 1)
+        
+        # Innovation 4: Eye Enhancement (post-processing)
+        if gaze_corrector is not None and gaze_corrector.enhance_eyes:
+            pred_sr_rgb = gaze_corrector.enhance_eye_region(pred_sr_rgb)
+        
         pred_sr_rgb = add_water_mark(pred_sr_rgb, _water_mark)
         visulize_rgbs = torchvision.utils.make_grid([gt_rgb[0], pred_sr_rgb[0]], nrow=4, padding=0)
         images.append(visulize_rgbs.cpu())
@@ -203,12 +275,23 @@ if __name__ == '__main__':
     from tqdm.std import TqdmExperimentalWarning
     warnings.simplefilter("ignore", category=TqdmExperimentalWarning, lineno=0, append=False)
     # build args
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--image_path', '-i', required=True, type=str)
-    parser.add_argument('--driver_path', '-d', required=True, type=str)
-    parser.add_argument('--force_retrack', '-f', action='store_true')
-    parser.add_argument('--resume_path', '-r', default='./assets/GAGAvatar.pt', type=str)
+    parser = argparse.ArgumentParser(description='GAGAvatar Inference with Enhancements')
+    parser.add_argument('--image_path', '-i', required=True, type=str, help='Path to input image')
+    parser.add_argument('--driver_path', '-d', required=True, type=str, help='Path to driver sequence')
+    parser.add_argument('--force_retrack', '-f', action='store_true', help='Force retracking of faces')
+    parser.add_argument('--resume_path', '-r', default='./assets/GAGAvatar.pt', type=str, help='Path to model checkpoint')
+    
+    # Enhancement options
+    parser.add_argument('--enhanced', action='store_true', help='Enable all enhancements')
+    parser.add_argument('--temporal-smooth', action='store_true', help='Enable temporal smoothing (Innovation 1)')
+    parser.add_argument('--detail-enhance', action='store_true', help='Enable detail enhancement (Innovation 2)')
+    parser.add_argument('--expression-opt', action='store_true', help='Enable expression optimization (Innovation 3)')
+    parser.add_argument('--gaze-correct', action='store_true', help='Enable gaze correction (Innovation 4)')
+    
     args = parser.parse_args()
     # launch
     torch.set_float32_matmul_precision('high')
-    inference(args.image_path, args.driver_path, args.resume_path, args.force_retrack)
+    inference(args.image_path, args.driver_path, args.resume_path, args.force_retrack,
+              temporal_smooth=args.temporal_smooth, detail_enhance=args.detail_enhance,
+              expression_opt=args.expression_opt, gaze_correct=args.gaze_correct,
+              enhanced=args.enhanced)
