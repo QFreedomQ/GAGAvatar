@@ -7,7 +7,7 @@ import torchvision
 import torch.nn as nn
 from pytorch3d.renderer.implicit.harmonic_embedding import HarmonicEmbedding
 
-from core.models.modules import DINOBase, StyleUNet
+from core.models.modules import DINOBase, StyleUNet, DetailEnhancer
 from core.libs.utils_renderer import render_gaussian
 from core.libs.utils_perceptual import FacePerceptualLoss
 
@@ -29,6 +29,8 @@ class GAGAvatar(nn.Module):
         self.cam_params = {'focal_x': 12.0, 'focal_y': 12.0, 'size': [512, 512]}
         self.upsampler = StyleUNet(in_size=512, in_dim=32, out_dim=3, out_size=512)
         self.percep_loss = FacePerceptualLoss(loss_type='l1', weighted=True)
+        # Enhancement modules (Innovation 2: Detail Enhancement)
+        self.detail_enhancer = DetailEnhancer(num_levels=4, enhancement_strength=0.3)
 
     def forward(self, batch, train_frac=1.0, rand=True):
         batch_size = batch['f_image'].shape[0]
@@ -68,7 +70,7 @@ class GAGAvatar(nn.Module):
         return results
 
     @torch.no_grad()
-    def forward_expression(self, batch):
+    def forward_expression(self, batch, enable_detail_enhance=False, detail_strength=1.0):
         if not hasattr(self, '_gs_params'):
             batch_size = batch['f_image'].shape[0]
             f_image, f_planes = batch['f_image'], batch['f_planes']
@@ -99,6 +101,11 @@ class GAGAvatar(nn.Module):
             gs_params=gs_params, cam_matrix=t_transform, cam_params=self.cam_params
         )['images']
         sr_gen_images = self.upsampler(gen_images)
+        
+        # Innovation 2: Apply detail enhancement if enabled
+        if enable_detail_enhance and hasattr(self, 'detail_enhancer'):
+            sr_gen_images = self.detail_enhancer(sr_gen_images, strength_multiplier=detail_strength)
+        
         results = {
             't_image':t_image, 'gen_image': gen_images[:, :3], 'sr_gen_image': sr_gen_images,
         }
